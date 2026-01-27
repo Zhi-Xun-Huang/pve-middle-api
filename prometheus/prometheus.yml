@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'pve-middle-api'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['pve-middle-api:8000']
