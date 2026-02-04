@@ -112,12 +112,24 @@ class QuotaUpdateResponse(BaseModel):
     gpu_limit: int
 
 
+class AssignResellerRequest(BaseModel):
+    username: str
+    reseller_username: Optional[str] = None # If None, remove from reseller (direct management)
+
+
+class PromoteResellerRequest(BaseModel):
+    username: str
+    is_reseller: bool
+
+
 class UserUsage(BaseModel):
     username: str
     role: str = "user"
     gpu_limit: int
     gpu_used: int
     vm_count: int
+    is_reseller: bool = False
+    managed_by: Optional[str] = None
 
 
 class VMMetricPoint(BaseModel):

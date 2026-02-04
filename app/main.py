@@ -21,13 +21,35 @@ from .schemas import (
     VMActionResponse, VMCreateRequest, VMCreateResponse, VMStatusResponse, 
     VMSummary, QuotaUpdateRequest, QuotaUpdateResponse, UserUsage, 
     SystemConfigItem, SystemConfigUpdate, IPPoolCreate, IPPoolUpdate, IPPoolResponse,
-    VMMetricsResponse, FirewallRule, FirewallResponse, FirewallReorderRequest
+    VMMetricsResponse, FirewallRule, FirewallResponse, FirewallReorderRequest,
+    AssignResellerRequest, PromoteResellerRequest
 )
 from .tasks import create_vm_task, start_vm_task, stop_vm_task, delete_vm_task
 
 
 # Initialize Database Tables
 Base.metadata.create_all(bind=engine)
+
+# AUTO MIGRATION LOGIC
+def run_migrations():
+    try:
+        with engine.connect() as conn:
+            # Check if columns exist, if not add them
+            try:
+                conn.execute(text("ALTER TABLE user_quotas ADD COLUMN is_reseller BOOLEAN DEFAULT 0"))
+                print("MIGRATION: Added is_reseller column")
+            except Exception:
+                pass # Column likely exists
+
+            try:
+                conn.execute(text("ALTER TABLE user_quotas ADD COLUMN managed_by VARCHAR(255)"))
+                print("MIGRATION: Added managed_by column")
+            except Exception:
+                pass # Column likely exists
+    except Exception as e:
+        print(f"MIGRATION ERROR: {e}")
+
+run_migrations()
 
 security = HTTPBasic()
 
@@ -276,6 +298,56 @@ async def get_task_status(task_id: str, user: Dict[str, str] = Depends(verify_us
     }
 
 
+@app.post("/admin/promote_reseller", response_model=Dict[str, str])
+async def promote_reseller(
+    payload: PromoteResellerRequest,
+    db: Session = Depends(get_db),
+    user: Dict[str, str] = Depends(verify_user),
+) -> Dict[str, str]:
+    if user["role"] not in ["admin", "platform_admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    target_user = db.query(UserQuota).filter(UserQuota.username == payload.username).first()
+    if not target_user:
+        target_user = UserQuota(username=payload.username, gpu_limit=0)
+        db.add(target_user)
+    
+    target_user.is_reseller = payload.is_reseller
+    db.commit()
+    return {"status": "success", "message": f"User {payload.username} reseller status set to {payload.is_reseller}"}
+
+
+@app.post("/admin/assign_reseller", response_model=Dict[str, str])
+async def assign_reseller(
+    payload: AssignResellerRequest,
+    db: Session = Depends(get_db),
+    user: Dict[str, str] = Depends(verify_user),
+) -> Dict[str, str]:
+    if user["role"] not in ["admin", "platform_admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Check target
+    target_user_quota = db.query(UserQuota).filter(UserQuota.username == payload.username).first()
+    if not target_user_quota:
+        target_user_quota = UserQuota(username=payload.username, gpu_limit=0)
+        db.add(target_user_quota)
+    
+    if payload.reseller_username:
+        # Verify reseller
+        reseller = db.query(UserQuota).filter(
+            UserQuota.username == payload.reseller_username, 
+            UserQuota.is_reseller == True
+        ).first()
+        if not reseller:
+            raise HTTPException(status_code=404, detail="Reseller not found or invalid")
+    
+    target_user_quota.managed_by = payload.reseller_username
+    db.commit()
+    
+    msg = f"User {payload.username} assigned to {payload.reseller_username}" if payload.reseller_username else f"User {payload.username} removed from reseller"
+    return {"status": "success", "message": msg}
+
+
 @app.post("/vm_user_quota", response_model=QuotaUpdateResponse)
 async def update_user_quota(
     payload: QuotaUpdateRequest,
@@ -283,21 +355,39 @@ async def update_user_quota(
     user: Dict[str, str] = Depends(verify_user),
 ) -> QuotaUpdateResponse:
     try:
-        # Check permissions: only platform_admin or admin can update quotas
-        if user["role"] not in ["platform_admin", "admin"]:
+        # Determine if requester is Reseller
+        requester_quota = db.query(UserQuota).filter(UserQuota.username == user["username"]).first()
+        is_reseller = requester_quota.is_reseller if requester_quota else False
+        
+        # Permissions Check
+        if user["role"] not in ["platform_admin", "admin"] and not is_reseller:
             raise HTTPException(status_code=403, detail="Not authorized to update quotas")
 
         target_username = payload.username
         new_limit = payload.gpu_limit
 
+        # If Reseller, verify management rights and quota limits
+        if is_reseller and user["role"] not in ["platform_admin", "admin"]:
+            # 1. Target must be managed by this reseller
+            target_quota = db.query(UserQuota).filter(UserQuota.username == target_username).first()
+            if not target_quota or target_quota.managed_by != user["username"]:
+                raise HTTPException(status_code=403, detail="You do not manage this user")
+            
+            # 2. Check Reseller's Total Quota
+            # Sum of limits of ALL managed users (including the new limit for target)
+            managed_users = db.query(UserQuota).filter(UserQuota.managed_by == user["username"]).all()
+            
+            current_allocated = sum(u.gpu_limit for u in managed_users if u.username != target_username)
+            total_needed = current_allocated + new_limit
+            
+            if total_needed > requester_quota.gpu_limit:
+                raise HTTPException(status_code=400, detail=f"Insufficient reseller quota. Allocated: {current_allocated}, Requested New Total: {total_needed}, Your Limit: {requester_quota.gpu_limit}")
+
         user_quota = db.query(UserQuota).filter(UserQuota.username == target_username).first()
-        
         if not user_quota:
-            # Create new quota record
             user_quota = UserQuota(username=target_username, gpu_limit=new_limit)
             db.add(user_quota)
         else:
-            # Update existing record
             user_quota.gpu_limit = new_limit
             
         db.commit()
@@ -320,21 +410,25 @@ async def list_users_usage(
     auth_db: Session = Depends(get_auth_db),
     user: Dict[str, str] = Depends(verify_user),
 ) -> List[UserUsage]:
-    # 1. Check Permissions
-    if user["role"] not in ["admin", "platform_admin"]:
+    # 1. Check Permissions & Reseller Status
+    requester_quota = db.query(UserQuota).filter(UserQuota.username == user["username"]).first()
+    is_reseller = requester_quota.is_reseller if requester_quota else False
+    
+    if user["role"] not in ["admin", "platform_admin"] and not is_reseller:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    # 2. Get All Users from Auth DB
+    # 2. Get Users (All for Admin, Filtered for Reseller)
     try:
+        # Get all users first, filter later
         auth_users = auth_db.execute(text("SELECT username, role FROM users")).fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query auth database: {e}")
 
-    # 3. Get Quotas from Local DB
+    # 3. Get Local Quota Info
     quotas = db.query(UserQuota).all()
-    quota_map = {q.username: q.gpu_limit for q in quotas}
+    quota_map = {q.username: q for q in quotas}
 
-    # 4. Get Usage from Local DB
+    # 4. Get Usage
     usage_stats = db.query(
         UserVM.username,
         func.sum(UserVM.gpu_count).label("total_gpu"),
@@ -346,14 +440,23 @@ async def list_users_usage(
         for u in usage_stats
     }
 
-    # 5. Merge Data
+    # 5. Build Result
     result = []
     for u in auth_users:
-        # Access by index for raw SQL results
         username = u[0]
         role = u[1]
+        
+        q_info = quota_map.get(username)
+        q_limit = q_info.gpu_limit if q_info else 0
+        is_r = q_info.is_reseller if q_info else False
+        managed_by = q_info.managed_by if q_info else None
 
-        q_limit = quota_map.get(username, 0) # Default 0
+        # Filter for Reseller
+        if is_reseller and user["role"] not in ["admin", "platform_admin"]:
+            # Reseller can see themselves and their managed users
+            if username != user["username"] and managed_by != user["username"]:
+                continue
+
         u_stats = usage_map.get(username, {"gpu": 0, "count": 0})
         
         result.append(UserUsage(
@@ -361,7 +464,9 @@ async def list_users_usage(
             role=role,
             gpu_limit=q_limit,
             gpu_used=int(u_stats["gpu"]),
-            vm_count=int(u_stats["count"])
+            vm_count=int(u_stats["count"]),
+            is_reseller=is_r,
+            managed_by=managed_by
         ))
         
     return result

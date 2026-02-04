@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, func
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, func
 from .database import Base
 
 class UserVM(Base):
@@ -28,6 +28,8 @@ class UserQuota(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(255), unique=True, index=True, nullable=False)
     gpu_limit = Column(Integer, default=0)
+    is_reseller = Column(Boolean, default=False)
+    managed_by = Column(String(255), nullable=True, index=True) # Username of the reseller
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 
