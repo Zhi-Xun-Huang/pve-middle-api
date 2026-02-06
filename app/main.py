@@ -354,54 +354,24 @@ async def update_user_quota(
     db: Session = Depends(get_db),
     user: Dict[str, str] = Depends(verify_user),
 ) -> QuotaUpdateResponse:
-    try:
-        # Determine if requester is Reseller
-        requester_quota = db.query(UserQuota).filter(UserQuota.username == user["username"]).first()
-        is_reseller = requester_quota.is_reseller if requester_quota else False
+    if user["role"] not in ["platform_admin", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    user_quota = db.query(UserQuota).filter(UserQuota.username == payload.username).first()
+    if not user_quota:
+        user_quota = UserQuota(username=payload.username, gpu_limit=payload.gpu_limit)
+        db.add(user_quota)
+    else:
+        user_quota.gpu_limit = payload.gpu_limit
         
-        # Permissions Check
-        if user["role"] not in ["platform_admin", "admin"] and not is_reseller:
-            raise HTTPException(status_code=403, detail="Not authorized to update quotas")
-
-        target_username = payload.username
-        new_limit = payload.gpu_limit
-
-        # If Reseller, verify management rights and quota limits
-        if is_reseller and user["role"] not in ["platform_admin", "admin"]:
-            # 1. Target must be managed by this reseller
-            target_quota = db.query(UserQuota).filter(UserQuota.username == target_username).first()
-            if not target_quota or target_quota.managed_by != user["username"]:
-                raise HTTPException(status_code=403, detail="You do not manage this user")
-            
-            # 2. Check Reseller's Total Quota
-            # Sum of limits of ALL managed users (including the new limit for target)
-            managed_users = db.query(UserQuota).filter(UserQuota.managed_by == user["username"]).all()
-            
-            current_allocated = sum(u.gpu_limit for u in managed_users if u.username != target_username)
-            total_needed = current_allocated + new_limit
-            
-            if total_needed > requester_quota.gpu_limit:
-                raise HTTPException(status_code=400, detail=f"Insufficient reseller quota. Allocated: {current_allocated}, Requested New Total: {total_needed}, Your Limit: {requester_quota.gpu_limit}")
-
-        user_quota = db.query(UserQuota).filter(UserQuota.username == target_username).first()
-        if not user_quota:
-            user_quota = UserQuota(username=target_username, gpu_limit=new_limit)
-            db.add(user_quota)
-        else:
-            user_quota.gpu_limit = new_limit
-            
-        db.commit()
-        db.refresh(user_quota)
-        
-        return QuotaUpdateResponse(
-            message="Quota updated successfully",
-            username=user_quota.username,
-            gpu_limit=user_quota.gpu_limit
-        )
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    db.commit()
+    db.refresh(user_quota)
+    
+    return QuotaUpdateResponse(
+        message="Quota updated successfully",
+        username=user_quota.username,
+        gpu_limit=user_quota.gpu_limit
+    )
 
 
 @app.get("/users", response_model=List[UserUsage])
@@ -410,25 +380,20 @@ async def list_users_usage(
     auth_db: Session = Depends(get_auth_db),
     user: Dict[str, str] = Depends(verify_user),
 ) -> List[UserUsage]:
-    # 1. Check Permissions & Reseller Status
-    requester_quota = db.query(UserQuota).filter(UserQuota.username == user["username"]).first()
-    is_reseller = requester_quota.is_reseller if requester_quota else False
-    
-    if user["role"] not in ["admin", "platform_admin"] and not is_reseller:
+    if user["role"] not in ["admin", "platform_admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    # 2. Get Users (All for Admin, Filtered for Reseller)
+    # Get Users
     try:
-        # Get all users first, filter later
-        auth_users = auth_db.execute(text("SELECT username, role FROM users")).fetchall()
+        auth_users = auth_db.execute(text("SELECT username, role, reseller_code FROM users")).fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to query auth database: {e}")
 
-    # 3. Get Local Quota Info
+    # Get Quotas
     quotas = db.query(UserQuota).all()
     quota_map = {q.username: q for q in quotas}
 
-    # 4. Get Usage
+    # Get Usage
     usage_stats = db.query(
         UserVM.username,
         func.sum(UserVM.gpu_count).label("total_gpu"),
@@ -440,33 +405,24 @@ async def list_users_usage(
         for u in usage_stats
     }
 
-    # 5. Build Result
     result = []
     for u in auth_users:
-        username = u[0]
-        role = u[1]
+        username = u.username
+        role = u.role
+        res_code = u.reseller_code
         
         q_info = quota_map.get(username)
-        q_limit = q_info.gpu_limit if q_info else 0
-        is_r = q_info.is_reseller if q_info else False
-        managed_by = q_info.managed_by if q_info else None
-
-        # Filter for Reseller
-        if is_reseller and user["role"] not in ["admin", "platform_admin"]:
-            # Reseller can see themselves and their managed users
-            if username != user["username"] and managed_by != user["username"]:
-                continue
-
+        gpu_limit = q_info.gpu_limit if q_info else 0
+        
         u_stats = usage_map.get(username, {"gpu": 0, "count": 0})
         
         result.append(UserUsage(
             username=username,
             role=role,
-            gpu_limit=q_limit,
+            gpu_limit=gpu_limit,
             gpu_used=int(u_stats["gpu"]),
             vm_count=int(u_stats["count"]),
-            is_reseller=is_r,
-            managed_by=managed_by
+            reseller_code=res_code
         ))
         
     return result

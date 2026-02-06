@@ -128,8 +128,7 @@ class UserUsage(BaseModel):
     gpu_limit: int
     gpu_used: int
     vm_count: int
-    is_reseller: bool = False
-    managed_by: Optional[str] = None
+    reseller_code: Optional[str] = None
 
 
 class VMMetricPoint(BaseModel):
