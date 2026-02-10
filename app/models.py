@@ -28,6 +28,7 @@ class UserQuota(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(255), unique=True, index=True, nullable=False)
     gpu_limit = Column(Integer, default=0)
+    storage_limit = Column(Integer, default=0)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 

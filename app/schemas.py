@@ -104,12 +104,14 @@ class VMSummary(BaseModel):
 class QuotaUpdateRequest(BaseModel):
     username: str = Field(..., description="Target username to update quota for")
     gpu_limit: int = Field(..., ge=0, description="New GPU limit")
+    storage_limit: int = Field(..., ge=0, description="New Storage limit in GB")
 
 
 class QuotaUpdateResponse(BaseModel):
     message: str
     username: str
     gpu_limit: int
+    storage_limit: int
 
 
 class AssignResellerRequest(BaseModel):

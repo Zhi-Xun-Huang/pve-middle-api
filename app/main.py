@@ -359,10 +359,11 @@ async def update_user_quota(
 
     user_quota = db.query(UserQuota).filter(UserQuota.username == payload.username).first()
     if not user_quota:
-        user_quota = UserQuota(username=payload.username, gpu_limit=payload.gpu_limit)
+        user_quota = UserQuota(username=payload.username, gpu_limit=payload.gpu_limit, storage_limit=payload.storage_limit)
         db.add(user_quota)
     else:
         user_quota.gpu_limit = payload.gpu_limit
+        user_quota.storage_limit = payload.storage_limit
         
     db.commit()
     db.refresh(user_quota)
@@ -370,7 +371,8 @@ async def update_user_quota(
     return QuotaUpdateResponse(
         message="Quota updated successfully",
         username=user_quota.username,
-        gpu_limit=user_quota.gpu_limit
+        gpu_limit=user_quota.gpu_limit,
+        storage_limit=user_quota.storage_limit
     )
 
 
@@ -442,33 +444,43 @@ async def create_vm(
         # Force the VM's login user to be the same as the creator
         payload.username = user["username"]
         
-        # --- GPU Quota Check ---
-        # 1. Determine requested GPUs
-        profile_info = svc.get_vm_profile(payload.vm_profile)
-        requested_gpus = profile_info.get("gpus", 0)
-        
-        # 2. Check User Quota
+        # --- Quota Check ---
         user_quota = db.query(UserQuota).filter(UserQuota.username == user["username"]).first()
         if not user_quota:
             print(f"DEBUG: No quota found for {user['username']}, creating default 0...")
             # Auto-create default quota if not exists
-            user_quota = UserQuota(username=user["username"], gpu_limit=0)
+            user_quota = UserQuota(username=user["username"], gpu_limit=0, storage_limit=0)
             db.add(user_quota)
             db.commit()
             db.refresh(user_quota)
-            
+
+        # 1. GPU Check
+        profile_info = svc.get_vm_profile(payload.vm_profile)
+        requested_gpus = profile_info.get("gpus", 0)
         if requested_gpus > 0:
-            # 3. Calculate current usage
-            current_usage = db.query(func.sum(UserVM.gpu_count)).filter(
+            current_gpu_usage = db.query(func.sum(UserVM.gpu_count)).filter(
                 UserVM.username == user["username"],
                 UserVM.status != "deleted"
             ).scalar() or 0
             
-            if (current_usage + requested_gpus) > user_quota.gpu_limit:
+            if (current_gpu_usage + requested_gpus) > user_quota.gpu_limit:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"GPU quota exceeded. Limit: {user_quota.gpu_limit}, Current: {current_usage}, Requested: {requested_gpus}"
+                    detail=f"GPU quota exceeded. Limit: {user_quota.gpu_limit}, Current: {current_gpu_usage}, Requested: {requested_gpus}"
                 )
+
+        # 2. Storage Check
+        requested_storage = payload.storage_size
+        current_storage_usage = db.query(func.sum(UserVM.storage_gb)).filter(
+            UserVM.username == user["username"],
+            UserVM.status != "deleted"
+        ).scalar() or 0
+
+        if (current_storage_usage + requested_storage) > user_quota.storage_limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Storage quota exceeded. Limit: {user_quota.storage_limit}GB, Current: {current_storage_usage}GB, Requested: {requested_storage}GB"
+            )
         # -----------------------
 
         # --- IP Availability Check (Sync Pre-check) ---
